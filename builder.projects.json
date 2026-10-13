@@ -1,0 +1,10 @@
+{
+  "projects": [
+    {
+      "id": "pc658f221d63fd1a535b7b04e07068a99",
+      "runner": "windows-2025",
+      "rev": "2e9c1eecc3da123eb324c5c04406e91e",
+      "feeds_required": false
+    }
+  ]
+}
