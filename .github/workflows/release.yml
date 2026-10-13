@@ -1,7 +1,8 @@
 name: Generic artifact build pipeline
 
 # Privacy and lifecycle rules baked into this workflow:
-#   - No Actions artifacts and no release is ever created on this public repository.
+#   - Only opt-in authenticated diagnostic ciphertext may be uploaded as an Actions artifact.
+#     No release is ever created on this public repository.
 #   - Private credentials are scoped to one opaque Actions environment and only to the
 #     exact step that consumes them.
 #   - Setup actions finish before authenticated decryption. Decrypted files live only
@@ -335,7 +336,17 @@ jobs:
             $zip.Dispose()
           }
 
+      - name: Record diagnostic framework integrity
+        id: diagnostic-integrity
+        run: |
+          $ErrorActionPreference = 'Stop'
+          foreach ($name in @('crypto','diagnostic-policy','diagnostics')) {
+            $hash = (Get-FileHash -LiteralPath "./scripts/$name.ps1" -Algorithm SHA256).Hash.ToLowerInvariant()
+            "$name=$hash" | Out-File -LiteralPath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          }
+
       - name: Run committed project body
+        id: project-body
         env:
           RELEASE_ASSET_POLICY: ${{ secrets.RELEASE_ASSET_POLICY }}
           UPDATE_FEED_URL_A: ${{ secrets.UPDATE_FEED_URL_A }}
@@ -434,26 +445,85 @@ jobs:
             }
             return 'unknown'
           }
+          $bodySucceeded = $false
           try {
             Push-Location $workspace
             try {
               $global:LASTEXITCODE = 0
               & $bodyPath *> $buildLog
               if ($LASTEXITCODE -ne 0) { throw 'opaque project body returned a failure code' }
+              $bodySucceeded = $true
             } finally {
               Pop-Location
             }
           } catch {
+            # Preserve the terminating exception only in the ephemeral private log.
+            try { ($_ | Out-String) | Add-Content -LiteralPath $buildLog } catch { }
             $safePhase = Read-SafePhase
             throw "Opaque project build phase failed at safe phase '$safePhase'."
           } finally {
-            Remove-Item -LiteralPath $buildLog -Force -ErrorAction SilentlyContinue
+            if ($bodySucceeded) { Remove-Item -LiteralPath $buildLog -Force -ErrorAction SilentlyContinue }
           }
+
+      - name: Collect encrypted failure diagnostic
+        id: diagnostics
+        if: ${{ always() && steps.project-body.outcome == 'failure' }}
+        continue-on-error: true
+        env:
+          BUILD_BUNDLE_KEY: ${{ secrets.BUILD_BUNDLE_KEY }}
+          DIAGNOSTICS_POLICY: ${{ secrets.DIAGNOSTICS_POLICY }}
+          EXPECTED_REVISION: ${{ secrets.EXPECTED_REVISION }}
+          PROJECT_ID: ${{ matrix.project.id }}
+          PROJECT_REV: ${{ matrix.project.rev }}
+          BUILDER_SHA: ${{ github.sha }}
+          EXPECTED_CRYPTO: ${{ steps.diagnostic-integrity.outputs.crypto }}
+          EXPECTED_POLICY: ${{ steps.diagnostic-integrity.outputs.diagnostic-policy }}
+          EXPECTED_COLLECTOR: ${{ steps.diagnostic-integrity.outputs.diagnostics }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          try {
+            $sources = @{}
+            foreach ($item in @(@('crypto',$env:EXPECTED_CRYPTO),@('diagnostic-policy',$env:EXPECTED_POLICY),@('diagnostics',$env:EXPECTED_COLLECTOR))) {
+              if ($item[1] -cnotmatch '^[0-9a-f]{64}$') { throw 'Diagnostic framework binding unavailable.' }
+              $path = [IO.Path]::GetFullPath("./scripts/$($item[0]).ps1")
+              $entry = Get-Item -LiteralPath $path -Force
+              if ($entry.PSIsContainer -or $entry.Length -gt 1048576) { throw 'Diagnostic framework file is invalid.' }
+              $cursor = $entry
+              while ($null -ne $cursor) {
+                if (($cursor.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw 'Diagnostic framework reparse path is forbidden.' }
+                $cursor = if ($cursor -is [IO.DirectoryInfo]) { $cursor.Parent } else { $cursor.Directory }
+              }
+              $bytes = [IO.File]::ReadAllBytes($path)
+              $hash = [Security.Cryptography.SHA256]::Create()
+              try { $actual = ([BitConverter]::ToString($hash.ComputeHash($bytes))).Replace('-','').ToLowerInvariant() } finally { $hash.Dispose() }
+              if ($actual -cne $item[1]) { throw 'Diagnostic framework changed after checkout.' }
+              $sources[$item[0]] = [Text.UTF8Encoding]::new($false,$true).GetString($bytes).TrimStart([char]0xFEFF)
+            }
+            $collector = [scriptblock]::Create($sources['diagnostics'])
+            $crypto = [scriptblock]::Create($sources['crypto'])
+            $policy = [scriptblock]::Create($sources['diagnostic-policy'])
+            & $collector -Mode Collect -TrustedCrypto $crypto -TrustedPolicy $policy
+          } catch { Write-Host 'Encrypted diagnostic collection unavailable.' }
+          finally { $env:BUILD_BUNDLE_KEY = $null; $env:DIAGNOSTICS_POLICY = $null }
+
+      - name: Retain encrypted failure diagnostic
+        if: ${{ always() && steps.diagnostics.outputs.ready == 'true' }}
+        continue-on-error: true
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: diagnostics-${{ matrix.project.id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/diagnostics-${{ matrix.project.id }}/diagnostics.bin
+          retention-days: 1
+          compression-level: 0
+          archive: true
+          include-hidden-files: false
+          if-no-files-found: warn
 
       - name: Remove decrypted project workspace
         if: always()
         env:
           PROJECT_ID: ${{ matrix.project.id }}
+          DIAGNOSTIC_STAGE_OWNED: ${{ steps.diagnostics.outputs.stage_owned }}
         run: |
           $workspace = Join-Path $env:RUNNER_TEMP "epb-$env:PROJECT_ID"
           if (Test-Path -LiteralPath $workspace) {
@@ -461,6 +531,16 @@ jobs:
           }
           if (Test-Path -LiteralPath $workspace) {
             throw 'Decrypted project workspace cleanup did not complete.'
+          }
+          $diagnostics = Join-Path $env:RUNNER_TEMP "diagnostics-$env:PROJECT_ID"
+          if ($env:DIAGNOSTIC_STAGE_OWNED -ceq 'true' -and (Test-Path -LiteralPath $diagnostics)) {
+            $cursor = Get-Item -LiteralPath $diagnostics -Force
+            if (-not $cursor.PSIsContainer) { throw 'Diagnostic staging changed before cleanup.' }
+            while ($null -ne $cursor) {
+              if (($cursor.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw 'Diagnostic staging changed before cleanup.' }
+              $cursor = $cursor.Parent
+            }
+            Remove-Item -LiteralPath $diagnostics -Recurse -Force
           }
 
       - name: Append build terminal to private Discussion
